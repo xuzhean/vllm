@@ -4,6 +4,7 @@ import enum
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
+from torch import Tensor
 from vllm.block import LogicalTokenBlock
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import SamplingParams
@@ -106,6 +107,7 @@ class SequenceData:
         self,
         prompt_token_ids: List[int],
         output_token_ids: Optional[List[int]] = None,
+        prompt_cached_block: Optional[Tensor] = None,
     ) -> None:
         if output_token_ids is None:
             output_token_ids = []
@@ -115,6 +117,16 @@ class SequenceData:
         self.cumulative_logprob = 0.0
         # The number of tokens that are computed (that run against the model).
         self._num_computed_tokens = 0
+
+        self.prompt_cached_block = prompt_cached_block
+        # if prompt_cached_block is not None:             # 已经计算的 token 数量为 block_num * block_size
+            # self._num_computed_tokens = prompt_cached_block.size(0) * prompt_cached_block.size(1)
+
+    def get_prompt_cached_block(self) -> Optional[Tensor]:
+        return self.prompt_cached_block
+    
+    def remove_prompt_cached_block(self) -> None:
+        self.prompt_cached_block = None
 
     def append_token_id(self, token_id: int, logprob: float) -> None:
         self.output_token_ids.append(token_id)
@@ -192,6 +204,7 @@ class Sequence:
         block_size: int,
         eos_token_id: Optional[int] = None,
         lora_request: Optional[LoRARequest] = None,
+        prompt_cached_block: Optional[Tensor] = None,
     ) -> None:
         self.seq_id = seq_id
         self.prompt = prompt
@@ -199,7 +212,9 @@ class Sequence:
         self.eos_token_id = eos_token_id
         self.lora_request = lora_request
 
-        self.data = SequenceData(prompt_token_ids)
+        print(f"@@@@ {prompt_token_ids=}, {prompt_cached_block=}")
+        self.data = SequenceData(prompt_token_ids, 
+                                 prompt_cached_block=prompt_cached_block)
         self.output_logprobs: SampleLogprobs = []
         self.output_text = ""
 

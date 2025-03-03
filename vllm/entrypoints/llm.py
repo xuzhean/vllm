@@ -1,6 +1,7 @@
 from typing import List, Optional, Union
 
 import torch
+from torch import Tensor
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
@@ -131,6 +132,7 @@ class LLM:
         use_tqdm: bool = True,
         lora_request: Optional[LoRARequest] = None,
         multi_modal_data: Optional[MultiModalData] = None,
+        prompts_cached_block: Optional[List[Tensor]] = None,
     ) -> List[RequestOutput]:
         """Generates the completions for the input prompts.
 
@@ -172,6 +174,8 @@ class LLM:
         # Add requests to the engine.
         num_requests = len(prompts) if prompts is not None else len(
             prompt_token_ids)
+        if prompts_cached_block is not None:
+            assert len(prompts_cached_block) == num_requests
         for i in range(num_requests):
             prompt = prompts[i] if prompts is not None else None
             token_ids = None if prompt_token_ids is None else prompt_token_ids[
@@ -186,6 +190,8 @@ class LLM:
                     type=multi_modal_data.type,
                     data=multi_modal_data.data[i].unsqueeze(0))
                 if multi_modal_data else None,
+                prompt_cached_block=None if prompts_cached_block is None \
+                    else prompts_cached_block[i]
             )
         return self._run_engine(use_tqdm)
 
@@ -196,6 +202,7 @@ class LLM:
         prompt_token_ids: Optional[List[int]],
         lora_request: Optional[LoRARequest] = None,
         multi_modal_data: Optional[MultiModalData] = None,
+        prompt_cached_block: Optional[Tensor] = None,
     ) -> None:
         request_id = str(next(self.request_counter))
         self.llm_engine.add_request(request_id,
@@ -203,7 +210,8 @@ class LLM:
                                     sampling_params,
                                     prompt_token_ids,
                                     lora_request=lora_request,
-                                    multi_modal_data=multi_modal_data)
+                                    multi_modal_data=multi_modal_data,
+                                    prompt_cached_block=prompt_cached_block)
 
     def _run_engine(self, use_tqdm: bool) -> List[RequestOutput]:
         # Initialize tqdm.

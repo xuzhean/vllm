@@ -1,6 +1,7 @@
 import time
 from typing import Iterable, List, Optional, Tuple, Type, Union
 
+from torch import Tensor
 from transformers import PreTrainedTokenizer
 
 import vllm
@@ -253,6 +254,7 @@ class LLMEngine:
         arrival_time: Optional[float] = None,
         lora_request: Optional[LoRARequest] = None,
         multi_modal_data: Optional[MultiModalData] = None,
+        prompt_cached_block: Optional[Tensor] = None,           # prompt 已经缓存在 CPU 的部分激活值, [block_num, block_size, layer_num, hidden]
     ) -> None:
         """Add a request to the engine's request pool.
 
@@ -319,7 +321,7 @@ class LLMEngine:
         eos_token_id = self.tokenizer.get_lora_tokenizer(
             lora_request).eos_token_id
         seq = Sequence(seq_id, prompt, prompt_token_ids, block_size,
-                       eos_token_id, lora_request)
+                       eos_token_id, lora_request, prompt_cached_block)
 
         # Defensive copy of SamplingParams, which are used by the sampler,
         # this doesn't deep-copy LogitsProcessor objects
@@ -667,6 +669,21 @@ class LLMEngine:
             >>>         break
         """
         seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
+
+        # 处理未复制的 prompt_cached_block
+        for seq_group_metadata in seq_group_metadata_list:
+            if not seq_group_metadata.is_prompt:
+                continue
+            
+            seq_ids = list(seq_group_metadata.seq_data.keys())
+            assert len(seq_ids) == 1
+            seq_id = seq_ids[0]
+            seq_data = seq_group_metadata.seq_data[seq_id]
+            prompt_cached_block = seq_data.get_prompt_cached_block()
+            if prompt_cached_block is None:
+                continue
+            
+            logger.info(f"### {seq_data.prompt_token_ids=}  #  {prompt_cached_block=}")
 
         if not scheduler_outputs.is_empty():
             output = self.model_executor.execute_model(
