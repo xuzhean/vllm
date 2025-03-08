@@ -202,7 +202,7 @@ class LLM:
         prompt_token_ids: Optional[List[int]],
         lora_request: Optional[LoRARequest] = None,
         multi_modal_data: Optional[MultiModalData] = None,
-        prompt_cached_block: Optional[Tensor] = None,
+        prompt_cached_block: Optional[List[Tensor]] = None,
     ) -> None:
         request_id = str(next(self.request_counter))
         self.llm_engine.add_request(request_id,

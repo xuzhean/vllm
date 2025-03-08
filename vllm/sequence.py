@@ -107,7 +107,7 @@ class SequenceData:
         self,
         prompt_token_ids: List[int],
         output_token_ids: Optional[List[int]] = None,
-        prompt_cached_block: Optional[Tensor] = None,
+        prompt_cached_block: Optional[List[Tensor]] = None,
     ) -> None:
         if output_token_ids is None:
             output_token_ids = []
@@ -118,11 +118,11 @@ class SequenceData:
         # The number of tokens that are computed (that run against the model).
         self._num_computed_tokens = 0
 
+        # shape: [layer_num, block_num, block_size, hidden]
         self.prompt_cached_block = prompt_cached_block
-        # if prompt_cached_block is not None:             # 已经计算的 token 数量为 block_num * block_size
-            # self._num_computed_tokens = prompt_cached_block.size(0) * prompt_cached_block.size(1)
+        
 
-    def get_prompt_cached_block(self) -> Optional[Tensor]:
+    def get_prompt_cached_block(self) -> Optional[List[Tensor]]:
         return self.prompt_cached_block
     
     def remove_prompt_cached_block(self) -> None:
@@ -204,7 +204,7 @@ class Sequence:
         block_size: int,
         eos_token_id: Optional[int] = None,
         lora_request: Optional[LoRARequest] = None,
-        prompt_cached_block: Optional[Tensor] = None,
+        prompt_cached_block: Optional[List[Tensor]] = None,
     ) -> None:
         self.seq_id = seq_id
         self.prompt = prompt
@@ -212,7 +212,6 @@ class Sequence:
         self.eos_token_id = eos_token_id
         self.lora_request = lora_request
 
-        print(f"@@@@ {prompt_token_ids=}, {prompt_cached_block=}")
         self.data = SequenceData(prompt_token_ids, 
                                  prompt_cached_block=prompt_cached_block)
         self.output_logprobs: SampleLogprobs = []

@@ -4,12 +4,15 @@ import os
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
+from torch import Tensor
 import torch.distributed
 
 from vllm.config import (CacheConfig, DeviceConfig, LoRAConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig, VisionLanguageConfig)
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
+from vllm.model_executor.layers.linear import QKVParallelLinear
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.parallel_utils import pynccl_utils
 from vllm.model_executor.parallel_utils.communication_op import (
     broadcast_tensor_dict)
@@ -184,6 +187,61 @@ class Worker:
         if blocks_to_copy:
             self.cache_engine.copy(blocks_to_copy)
 
+
+    def move_prompt_cache(self, a_cache: Tensor, k_cache: Tensor, v_cache: Tensor, 
+                          qkv_proj: QKVParallelLinear, rotary_emb: RotaryEmbedding,
+                          kv_size: int, positions: Tensor):
+        a_gpu = a_cache.to('cuda')
+        qkv, _ = qkv_proj(a_gpu)
+        q, k, v = qkv.split([kv_size, kv_size, kv_size], dim=-1)
+        q, k = rotary_emb(positions, q, k)
+        print(f"@@ {k.size()=},  {k_cache.size()=}")
+        k_cache.copy_(k.reshape(-1))
+        v_cache.copy_(v.reshape(-1))
+        
+
+    def process_prompts_cache(self, seq_group_metadata_list: List[SequenceGroupMetadata]):
+        for seq_group_metadata in seq_group_metadata_list:
+            if not seq_group_metadata.is_prompt:
+                continue
+            seq_ids = list(seq_group_metadata.seq_data.keys())
+            assert len(seq_ids) == 1
+            seq_id = seq_ids[0]
+            
+            computed_block_nums = []
+            seq_data = seq_group_metadata.seq_data[seq_id]
+            block_table = seq_group_metadata.block_tables[seq_id]
+            prompt_cached_block = seq_data.get_prompt_cached_block()
+            if prompt_cached_block is None:
+                continue
+            
+            print(f"#######\n{seq_data.get_token_ids()=}\n###\n{prompt_cached_block=}\n##\n{block_table=}\n")
+            # cpu: num_layers * [num_blocks, block_size, hidden_size]
+            # gpu: num_layers * [2, num_blocks, block_size * num_kv_heads * head_size]
+            
+            assert prompt_cached_block[0].size(0) <= len(block_table)
+            for i in range(prompt_cached_block[0].size(0)):
+                computed_block_nums.append(block_table[i])
+
+            model = self.model_runner.model.model
+            block_size = prompt_cached_block[0].size(1)
+            kv_size = self.gpu_cache[0].size(2) // block_size
+            for layer in range(len(prompt_cached_block)):
+                attn = model.layers[layer].self_attn
+                for i in range(prompt_cached_block[layer].size(0)):
+                    positions = torch.arange(i * block_size, (i + 1) * block_size,
+                                             device=self.gpu_cache[0].device)
+                    self.move_prompt_cache(prompt_cached_block[layer][i],
+                                           self.gpu_cache[layer][0][block_table[i]],
+                                           self.gpu_cache[layer][1][block_table[i]],
+                                           attn.qkv_proj, attn.rotary_emb,
+                                           kv_size, positions)
+            seq_data.update_num_computed_tokens(block_size * prompt_cached_block[0].size(0))
+            seq_data.remove_prompt_cached_block()
+            
+            print(f"####### DONE！！########")
+
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -217,6 +275,8 @@ class Worker:
         # If there is no input, we don't need to execute the model.
         if num_seq_groups == 0:
             return {}
+        
+        self.process_prompts_cache(seq_group_metadata_list)
 
         output = self.model_runner.execute_model(seq_group_metadata_list,
                                                  self.gpu_cache)

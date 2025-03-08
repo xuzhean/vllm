@@ -254,7 +254,7 @@ class LLMEngine:
         arrival_time: Optional[float] = None,
         lora_request: Optional[LoRARequest] = None,
         multi_modal_data: Optional[MultiModalData] = None,
-        prompt_cached_block: Optional[Tensor] = None,           # prompt 已经缓存在 CPU 的部分激活值, [block_num, block_size, layer_num, hidden]
+        prompt_cached_block: Optional[List[Tensor]] = None,   # prompt 已经缓存在 CPU 的部分激活值
     ) -> None:
         """Add a request to the engine's request pool.
 
@@ -670,7 +670,9 @@ class LLMEngine:
         """
         seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
 
+        """
         # 处理未复制的 prompt_cached_block
+        # 应在 worker 中处理
         for seq_group_metadata in seq_group_metadata_list:
             if not seq_group_metadata.is_prompt:
                 continue
@@ -684,6 +686,7 @@ class LLMEngine:
                 continue
             
             logger.info(f"### {seq_data.prompt_token_ids=}  #  {prompt_cached_block=}")
+        """
 
         if not scheduler_outputs.is_empty():
             output = self.model_executor.execute_model(

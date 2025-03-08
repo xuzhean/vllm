@@ -192,7 +192,8 @@ class ModelRunner:
                 prefix_block_tables.append([])
                 # Right now, prefill start is always 0. However, this
                 # assumption can be changed once chunked prefill is introduced.
-                assert computed_len == 0
+                # NOTE: 因为现在有 prompt cache，这条 assert 需要注释掉
+                # assert computed_len == 0
 
             # actual prompt lens
             context_lens.append(computed_len)

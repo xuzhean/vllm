@@ -34,9 +34,12 @@ prompts = [
 ]
 prompts_cached_block = []
 for i in range(3):
-    prompt = generate_random_prompt()
+    prompt = generate_random_prompt(3)
     prompts.append(prompt)
-    prompts_cached_block.append(torch.ones([2, 4]) * i)
+    cached_block = []
+    for layer in range(32):
+        cached_block.append(torch.rand(1, 16, 4096, dtype=torch.half))
+    prompts_cached_block.append(cached_block)
     
 print(prompts, prompts_cached_block)
 
