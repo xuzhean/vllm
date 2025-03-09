@@ -7,6 +7,11 @@ import random
 
 # 启用详细日志
 logging.basicConfig(level=logging.INFO)
+seed = 42
+random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
 
 sampling_params = SamplingParams(
     temperature=0.7,

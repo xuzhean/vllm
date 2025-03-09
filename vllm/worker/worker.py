@@ -1,4 +1,5 @@
 """A GPU worker class."""
+from collections import defaultdict
 import gc
 import os
 from typing import Dict, List, Optional, Set, Tuple
@@ -187,6 +188,7 @@ class Worker:
         if blocks_to_copy:
             self.cache_engine.copy(blocks_to_copy)
 
+    ################ SLOW (demo, TP 1) ################
 
     def move_prompt_cache(self, a_cache: Tensor, k_cache: Tensor, v_cache: Tensor, 
                           qkv_proj: QKVParallelLinear, rotary_emb: RotaryEmbedding,
@@ -195,12 +197,10 @@ class Worker:
         qkv, _ = qkv_proj(a_gpu)
         q, k, v = qkv.split([kv_size, kv_size, kv_size], dim=-1)
         q, k = rotary_emb(positions, q, k)
-        print(f"@@ {k.size()=},  {k_cache.size()=}")
         k_cache.copy_(k.reshape(-1))
         v_cache.copy_(v.reshape(-1))
         
-
-    def process_prompts_cache(self, seq_group_metadata_list: List[SequenceGroupMetadata]):
+    def slow_process_prompts_cache(self, seq_group_metadata_list: List[SequenceGroupMetadata]):
         for seq_group_metadata in seq_group_metadata_list:
             if not seq_group_metadata.is_prompt:
                 continue
@@ -215,9 +215,8 @@ class Worker:
             if prompt_cached_block is None:
                 continue
             
-            print(f"#######\n{seq_data.get_token_ids()=}\n###\n{prompt_cached_block=}\n##\n{block_table=}\n")
-            # cpu: num_layers * [num_blocks, block_size, hidden_size]
-            # gpu: num_layers * [2, num_blocks, block_size * num_kv_heads * head_size]
+            # cpu act cache: num_layers * [num_blocks, block_size, hidden_size]
+            # gpu kv cache: num_layers * [2, num_blocks, block_size * num_kv_heads * head_size]
             
             assert prompt_cached_block[0].size(0) <= len(block_table)
             for i in range(prompt_cached_block[0].size(0)):
@@ -238,8 +237,160 @@ class Worker:
                                            kv_size, positions)
             seq_data.update_num_computed_tokens(block_size * prompt_cached_block[0].size(0))
             seq_data.remove_prompt_cached_block()
+
+
+    ################ NORMAL (TP 1) ################
+    
+    def normal_process_prompts_cache(self, seq_group_metadata_list: List[SequenceGroupMetadata]):
+        for seq_group_metadata in seq_group_metadata_list:
+            if not seq_group_metadata.is_prompt:
+                continue
+            seq_ids = list(seq_group_metadata.seq_data.keys())
+            assert len(seq_ids) == 1
+            seq_id = seq_ids[0]
             
-            print(f"####### DONE！！########")
+            seq_data = seq_group_metadata.seq_data[seq_id]
+            block_table = seq_group_metadata.block_tables[seq_id]
+            prompt_cached_block = seq_data.get_prompt_cached_block()
+            if prompt_cached_block is None:
+                continue
+            
+            # Validate block table length
+            assert prompt_cached_block[0].size(0) <= len(block_table)
+            
+            model = self.model_runner.model.model
+            block_size = prompt_cached_block[0].size(1)
+            kv_size = self.gpu_cache[0].size(2) // block_size
+            
+            # 按层处理优化
+            for layer_idx in range(len(prompt_cached_block)):
+                layer_blocks = prompt_cached_block[layer_idx]
+                num_blocks = layer_blocks.size(0)
+                if num_blocks == 0:
+                    continue
+                
+                # 批量收集本层所有块的激活值
+                a_cpu = torch.cat([layer_blocks[i] for i in range(num_blocks)], dim=0)
+                
+                # 单次数据传输到GPU
+                a_gpu = a_cpu.to('cuda', non_blocking=True)
+                
+                # 批量计算qkv_proj
+                attn = model.layers[layer_idx].self_attn
+                qkv, _ = attn.qkv_proj(a_gpu)
+                q, k, v = qkv.split([kv_size, kv_size, kv_size], dim=-1)
+                
+                # 批量应用旋转位置编码
+                positions = torch.arange(0, num_blocks * block_size, 
+                                    device=a_gpu.device)
+                q, k = attn.rotary_emb(positions, q, k)
+                
+                # 批量处理KV缓存
+                for i in range(num_blocks):
+                    start = i * block_size
+                    end = start + block_size
+                    target_block = block_table[i]
+                    
+                    # 提取并展平当前块的KV
+                    k_block = k[start:end].contiguous().view(-1)
+                    v_block = v[start:end].contiguous().view(-1)
+                    
+                    # 批量复制到GPU缓存
+                    self.gpu_cache[layer_idx][0][target_block].copy_(k_block)
+                    self.gpu_cache[layer_idx][1][target_block].copy_(v_block)
+            
+            # 更新序列状态
+            seq_data.update_num_computed_tokens(block_size * num_blocks)
+            seq_data.remove_prompt_cached_block()
+
+
+    ################ FAST (TP 1) ################
+
+    def fast_process_prompts_cache(self, seq_group_metadata_list: List[SequenceGroupMetadata]):
+        # 按层组织需要处理的数据
+        layer_batches = defaultdict(lambda: {
+            'a_cpu': [],
+            'block_tables': [],
+            'position_offsets': [],
+            'seq_data_list': []
+        })
+
+        # 阶段1: 数据收集
+        for seq_group_metadata in seq_group_metadata_list:
+            if not seq_group_metadata.is_prompt:
+                continue
+            
+            seq_ids = list(seq_group_metadata.seq_data.keys())
+            if not seq_ids:
+                continue
+            seq_id = seq_ids[0]  # 假设每个组只有一个序列
+            
+            seq_data = seq_group_metadata.seq_data[seq_id]
+            prompt_cached_block = seq_data.get_prompt_cached_block()
+            if prompt_cached_block is None:
+                continue
+            
+            block_table = seq_group_metadata.block_tables[seq_id]
+            num_blocks = prompt_cached_block[0].size(0)
+            if num_blocks == 0:
+                continue
+            
+            # 记录全局位置偏移量（考虑已有计算量），一定为 0
+            base_offset = seq_data.get_num_computed_tokens()
+            block_size = prompt_cached_block[0].size(1)
+            
+            # 按层收集数据
+            for layer_idx in range(len(prompt_cached_block)):
+                layer_blocks = prompt_cached_block[layer_idx]
+                layer_batches[layer_idx]['a_cpu'].append(layer_blocks)
+                layer_batches[layer_idx]['block_tables'].extend(
+                    [block_table[i] for i in range(num_blocks)])
+                layer_batches[layer_idx]['position_offsets'].extend(
+                    [base_offset + i * block_size for i in range(num_blocks)])
+                layer_batches[layer_idx]['seq_data_list'].append(seq_data)
+            
+            # 更新序列状态
+            seq_data.update_num_computed_tokens(block_size * num_blocks)
+            seq_data.remove_prompt_cached_block()
+
+        # 阶段2: 按层批量处理
+        model = self.model_runner.model.model
+        for layer_idx, batch_data in layer_batches.items():
+            if not batch_data['a_cpu']:
+                continue
+
+            # 合并CPU激活值
+            a_cpu = torch.cat([block for blocks in batch_data['a_cpu'] for block in blocks], dim=0)
+            
+            # 异步传输到GPU
+            a_gpu = a_cpu.to('cuda', non_blocking=True)
+            
+            # 批量计算QKV投影
+            attn = model.layers[layer_idx].self_attn
+            qkv, _ = attn.qkv_proj(a_gpu)
+            block_size = batch_data['a_cpu'][0].size(1)
+            kv_size = self.gpu_cache[0].size(2) // block_size
+            q, k, v = qkv.split([kv_size, kv_size, kv_size], dim=-1)
+            
+            # 批量生成位置编码
+            positions = torch.cat([
+                torch.arange(offset, offset + block_size, device=a_gpu.device)
+                for offset in batch_data['position_offsets']
+            ])
+            q, k = attn.rotary_emb(positions, q, k)
+            
+            # 批量填充KV缓存
+            total_blocks = len(batch_data['block_tables'])
+            for i in range(total_blocks):
+                block_start = i * block_size
+                block_end = block_start + block_size
+                
+                k_block = k[block_start:block_end].contiguous().view(-1)
+                v_block = v[block_start:block_end].contiguous().view(-1)
+                
+                target_block = batch_data['block_tables'][i]
+                self.gpu_cache[layer_idx][0][target_block].copy_(k_block)
+                self.gpu_cache[layer_idx][1][target_block].copy_(v_block)
 
 
     @torch.inference_mode()
@@ -276,7 +427,7 @@ class Worker:
         if num_seq_groups == 0:
             return {}
         
-        self.process_prompts_cache(seq_group_metadata_list)
+        self.fast_process_prompts_cache(seq_group_metadata_list)
 
         output = self.model_runner.execute_model(seq_group_metadata_list,
                                                  self.gpu_cache)
