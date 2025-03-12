@@ -24,7 +24,7 @@
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from torch import nn
+from torch import Tensor, nn
 from transformers import LlamaConfig
 
 from vllm.attention import Attention, AttentionMetadata
@@ -149,7 +149,10 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        a_store: Optional[Tensor],
     ) -> torch.Tensor:
+        if a_store is not None:
+            a_store = hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
@@ -202,6 +205,7 @@ class LlamaDecoderLayer(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        a_store: Optional[Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
@@ -215,6 +219,7 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
+            a_store=a_store,
         )
 
         # Fully Connected
@@ -260,6 +265,7 @@ class LlamaModel(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
         inputs_embeds: Optional[torch.Tensor] = None,
+        a_store: Optional[List[Tensor]] = None,
     ) -> torch.Tensor:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
@@ -274,6 +280,7 @@ class LlamaModel(nn.Module):
                 kv_caches[i],
                 attn_metadata,
                 residual,
+                a_store=a_store,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -341,9 +348,10 @@ class LlamaForCausalLM(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
+        a_store: Optional[List[Tensor]] = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata)
+                                   attn_metadata, a_store=a_store)
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor,
