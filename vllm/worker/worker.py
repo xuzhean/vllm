@@ -430,9 +430,17 @@ class Worker:
             return {}
         
         self.fast_process_prompts_cache(seq_group_metadata_list)
+        
+        # TODO: 按 layer 返回 hook
 
         output = self.model_runner.execute_model(seq_group_metadata_list,
                                                  self.gpu_cache)
+        
+        # TODO: execute 结束，将激活值存下来
+        # 实现方式：prompt_cached_block 并列开 prompt_stored_block
+        # 开关控制是否写回
+        # 可以用来检查正确性，同时模拟多轮对话
+        
         return output
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
