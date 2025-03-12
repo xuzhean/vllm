@@ -20,16 +20,14 @@ sampling_params = SamplingParams(
     ignore_eos=True,
 )
 
-print("###e")
-
 llm = LLM(
     model="/datadisk/llama-7b",
-    tensor_parallel_size=1,
+    tensor_parallel_size=2,
+    worker_use_ray=True,
+    # tensor_parallel_size=1,
     swap_space=4,
     gpu_memory_utilization=0.95,
 )
-
-print("###e")
 
 prompts = [
     # "Hello, my name is",

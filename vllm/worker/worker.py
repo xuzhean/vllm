@@ -412,6 +412,7 @@ class Worker:
                 "blocks_to_swap_in": blocks_to_swap_in,
                 "blocks_to_swap_out": blocks_to_swap_out,
                 "blocks_to_copy": blocks_to_copy,
+                "seq_group_metadata_list": seq_group_metadata_list,
             }
             broadcast_tensor_dict(data, src=0)
         else:
@@ -420,6 +421,7 @@ class Worker:
             blocks_to_swap_in = data["blocks_to_swap_in"]
             blocks_to_swap_out = data["blocks_to_swap_out"]
             blocks_to_copy = data["blocks_to_copy"]
+            seq_group_metadata_list = data["seq_group_metadata_list"]
 
         self.cache_swap(blocks_to_swap_in, blocks_to_swap_out, blocks_to_copy)
 
