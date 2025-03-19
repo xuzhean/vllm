@@ -21,7 +21,7 @@ def generate_random_prompt(re: int = 1):
     for i in range(re):
         prompt = prompt + random_sentence()
     if re > 1:
-        prompt = prompt + "####"
+        prompt = prompt + " | "
     return prompt
 
 # 生成 100 条随机 prompt

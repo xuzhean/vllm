@@ -82,6 +82,7 @@ class LlamaAttention(nn.Module):
 
     def __init__(
         self,
+        layer_idx: int,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -93,6 +94,7 @@ class LlamaAttention(nn.Module):
         sliding_window: Optional[int] = None,
     ) -> None:
         super().__init__()
+        self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -158,24 +160,27 @@ class LlamaAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         output, _ = self.o_proj(attn_output)
-        return output
+        return output, a_store
 
 
 class LlamaDecoderLayer(nn.Module):
 
     def __init__(
         self,
+        layer_idx: int,
         config: LlamaConfig,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
         sliding_window = getattr(config, "sliding_window", None)
         self.self_attn = LlamaAttention(
+            layer_idx=self.layer_idx,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=getattr(config, "num_key_value_heads",
@@ -214,7 +219,7 @@ class LlamaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
-        hidden_states = self.self_attn(
+        hidden_states, a_store = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
@@ -226,7 +231,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        return hidden_states, residual, a_store
 
 
 class LlamaModel(nn.Module):
@@ -250,8 +255,8 @@ class LlamaModel(nn.Module):
             org_num_embeddings=config.vocab_size,
         )
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, linear_method)
-            for _ in range(config.num_hidden_layers)
+            LlamaDecoderLayer(layer_idx, config, linear_method)
+            for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -265,7 +270,7 @@ class LlamaModel(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
         inputs_embeds: Optional[torch.Tensor] = None,
-        a_store: Optional[List[Tensor]] = None,
+        a_store_list: Optional[List[Tensor]] = None,
     ) -> torch.Tensor:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
@@ -274,16 +279,18 @@ class LlamaModel(nn.Module):
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states, residual = layer(
+            hidden_states, residual, a_store = layer(
                 positions,
                 hidden_states,
                 kv_caches[i],
                 attn_metadata,
                 residual,
-                a_store=a_store,
+                a_store=a_store_list[i] if a_store_list is not None else None,
             )
+            if a_store is not None:
+                a_store_list[i] = a_store
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        return hidden_states, a_store_list
 
 
 class LlamaForCausalLM(nn.Module):
@@ -348,11 +355,11 @@ class LlamaForCausalLM(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
-        a_store: Optional[List[Tensor]] = None,
+        a_store_list: Optional[List[Tensor]] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata, a_store=a_store)
-        return hidden_states
+        hidden_states, a_store_list = self.model(input_ids, positions, kv_caches,
+                                   attn_metadata, a_store_list=a_store_list)
+        return hidden_states, a_store_list
 
     def compute_logits(self, hidden_states: torch.Tensor,
                        sampling_metadata: SamplingMetadata) -> torch.Tensor:

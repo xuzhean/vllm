@@ -1,10 +1,12 @@
 import contextlib
+import os
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
+from torch import Tensor
 
 from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.config import (DeviceConfig, LoRAConfig, ModelConfig, ParallelConfig,
@@ -150,6 +152,8 @@ class ModelRunner:
         subquery_lens: List[int] = []
         prefix_block_tables: List[List[int]] = []
         multi_modal_input_list: List[torch.Tensor] = []
+        
+        block_size = int(os.getenv('BLOCK_SIZE'))
 
         for seq_group_metadata in seq_group_metadata_list:
             assert seq_group_metadata.is_prompt
@@ -174,7 +178,8 @@ class ModelRunner:
                               computed_len + token_chunk_size)
             # TODO(sang): Rename it after chunked prefill is introduced.
             prompt_tokens = seq_data.get_token_ids()[computed_len:prefill_end]
-            prompt_len = len(prompt_tokens)
+            prompt_len = len(prompt_tokens) # 奇怪 prompt_len 不正确
+            prompt_len = seq_data.get_len()
             # Right now, the prefill_end is always same as the length of
             # sequence. However, once chunked prefill is introduced, this
             # assumption can be changed.
@@ -194,10 +199,17 @@ class ModelRunner:
                 # assumption can be changed once chunked prefill is introduced.
                 # NOTE: 因为现在有 prompt cache，这条 assert 需要注释掉
                 # assert computed_len == 0
+                
+            # 记录当前 seq 计算的块数，方便后续 store
+            seq_data.set_prompt_a_stored_info(
+                (prompt_len - computed_len) // block_size,
+                (prompt_len - computed_len) % block_size
+            )
 
             # actual prompt lens
             context_lens.append(computed_len)
             subquery_lens.append(prompt_len - computed_len)
+            print(f"## {seq_group_metadata.request_id}: {computed_len}, {prompt_len}")
 
             input_tokens.extend(prompt_tokens)
             # NOTE(woosuk): Here we assume that the first token in the prompt
@@ -639,6 +651,7 @@ class ModelRunner:
         self,
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
         kv_caches: List[torch.Tensor],
+        a_store_list: Optional[List[torch.Tensor]] = None,
     ) -> Optional[SamplerOutput]:
         (input_tokens, input_positions, attn_metadata, sampling_metadata,
          lora_requests, lora_mapping, multi_modal_input
@@ -652,16 +665,17 @@ class ModelRunner:
             graph_batch_size = input_tokens.shape[0]
             model_executable = self.graph_runners[graph_batch_size]
         else:
-            model_executable = self.model
+            model_executable = self.model            
         execute_model_kwargs = {
             "input_ids": input_tokens,
             "positions": input_positions,
             "kv_caches": kv_caches,
             "attn_metadata": attn_metadata,
+            "a_store_list": a_store_list,
         }
         if self.vision_language_config:
             execute_model_kwargs.update({"image_input": multi_modal_input})
-        hidden_states = model_executable(**execute_model_kwargs)
+        hidden_states, a_store_list = model_executable(**execute_model_kwargs)
 
         # Compute the logits.
         logits = self.model.compute_logits(hidden_states, sampling_metadata)
@@ -675,7 +689,7 @@ class ModelRunner:
             logits=logits,
             sampling_metadata=sampling_metadata,
         )
-        return output
+        return output, a_store_list
 
     @torch.inference_mode()
     def profile_run(self) -> None:

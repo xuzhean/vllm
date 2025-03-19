@@ -188,7 +188,7 @@ class Worker:
         if blocks_to_copy:
             self.cache_engine.copy(blocks_to_copy)
 
-    ################ SLOW (demo, TP 1) ################
+    ################ DEMO ################
 
     def move_prompt_cache(self, a_cache: Tensor, k_cache: Tensor, v_cache: Tensor, 
                           qkv_proj: QKVParallelLinear, rotary_emb: RotaryEmbedding,
@@ -200,7 +200,7 @@ class Worker:
         k_cache.copy_(k.reshape(-1))
         v_cache.copy_(v.reshape(-1))
         
-    def slow_process_prompts_cache(self, seq_group_metadata_list: List[SequenceGroupMetadata]):
+    def demo_process_prompts_cache(self, seq_group_metadata_list: List[SequenceGroupMetadata]):
         for seq_group_metadata in seq_group_metadata_list:
             if not seq_group_metadata.is_prompt:
                 continue
@@ -211,102 +211,73 @@ class Worker:
             computed_block_nums = []
             seq_data = seq_group_metadata.seq_data[seq_id]
             block_table = seq_group_metadata.block_tables[seq_id]
-            prompt_cached_block = seq_data.get_prompt_cached_block()
-            if prompt_cached_block is None:
+            prompt_a_cached_block = seq_data.get_prompt_a_cached_block()
+            if prompt_a_cached_block is None:
                 continue
-            
-            # cpu act cache: num_layers * [num_blocks, block_size, hidden_size]
-            # gpu kv cache: num_layers * [2, num_blocks, block_size * num_kv_heads * head_size]
-            
-            assert prompt_cached_block[0].size(0) <= len(block_table)
-            for i in range(prompt_cached_block[0].size(0)):
+
+            assert prompt_a_cached_block[0].size(0) <= len(block_table)
+            for i in range(prompt_a_cached_block[0].size(0)):
                 computed_block_nums.append(block_table[i])
 
             model = self.model_runner.model.model
-            block_size = prompt_cached_block[0].size(1)
+            block_size = prompt_a_cached_block[0].size(1)
             kv_size = self.gpu_cache[0].size(2) // block_size
-            for layer in range(len(prompt_cached_block)):
+            for layer in range(len(prompt_a_cached_block)):
                 attn = model.layers[layer].self_attn
-                for i in range(prompt_cached_block[layer].size(0)):
+                for i in range(prompt_a_cached_block[layer].size(0)):
                     positions = torch.arange(i * block_size, (i + 1) * block_size,
                                              device=self.gpu_cache[0].device)
-                    self.move_prompt_cache(prompt_cached_block[layer][i],
+                    self.move_prompt_cache(prompt_a_cached_block[layer][i],
                                            self.gpu_cache[layer][0][block_table[i]],
                                            self.gpu_cache[layer][1][block_table[i]],
                                            attn.qkv_proj, attn.rotary_emb,
                                            kv_size, positions)
-            seq_data.update_num_computed_tokens(block_size * prompt_cached_block[0].size(0))
-            seq_data.remove_prompt_cached_block()
+            seq_data.update_num_computed_tokens(block_size * prompt_a_cached_block[0].size(0))
+            seq_data.remove_prompt_a_cached_block()
+
+    # NOTE:          
+    # cpu act cache: num_layers * [num_blocks, block_size, hidden_size]
+    # gpu kv cache: num_layers * [2, num_blocks, block_size * num_kv_heads * head_size]
 
 
-    ################ NORMAL (TP 1) ################
-    
-    def normal_process_prompts_cache(self, seq_group_metadata_list: List[SequenceGroupMetadata]):
+    def process_prompts_store_demo(self, seq_group_metadata_list: List[SequenceGroupMetadata],
+                                   a_store_list: List[Tensor],
+                                   a_store_dict: Optional[Dict[int, List[Tensor]]] = None):
+        block_size = int(os.getenv("BLOCK_SIZE"))
+        hidden_size = int(os.getenv("HIDDEN_SIZE"))
+        assert a_store_dict is not None
+        
+        # a_store 从 GPU 移动到 CPU
+        assert a_store_list[0].device.type == 'cuda'
+        a_store_list_cpu = []
+        for layer_idx in range(len(a_store_list)):
+            a_store_list_cpu.append(a_store_list[layer_idx].cpu())
+        
+        cur_idx = 0
         for seq_group_metadata in seq_group_metadata_list:
-            if not seq_group_metadata.is_prompt:
-                continue
+            assert seq_group_metadata.is_prompt
             seq_ids = list(seq_group_metadata.seq_data.keys())
             assert len(seq_ids) == 1
             seq_id = seq_ids[0]
             
             seq_data = seq_group_metadata.seq_data[seq_id]
-            block_table = seq_group_metadata.block_tables[seq_id]
-            prompt_cached_block = seq_data.get_prompt_cached_block()
-            if prompt_cached_block is None:
-                continue
+            block_num, unblocked_size = seq_data.get_pormpt_a_stored_info()
+            print(f"@@ {block_num=}, {unblocked_size=}")
+            prompt_a_stored_block = []
             
-            # Validate block table length
-            assert prompt_cached_block[0].size(0) <= len(block_table)
+            for layer_idx in range(len(a_store_list_cpu)):
+                blocks = a_store_list_cpu[layer_idx][cur_idx : cur_idx + block_num * block_size]
+                blocks = blocks.reshape(block_num, block_size, hidden_size)
+                prompt_a_stored_block.append(blocks)
+                
+            cur_idx += block_num * block_size + unblocked_size
             
-            model = self.model_runner.model.model
-            block_size = prompt_cached_block[0].size(1)
-            kv_size = self.gpu_cache[0].size(2) // block_size
-            
-            # 按层处理优化
-            for layer_idx in range(len(prompt_cached_block)):
-                layer_blocks = prompt_cached_block[layer_idx]
-                num_blocks = layer_blocks.size(0)
-                if num_blocks == 0:
-                    continue
-                
-                # 批量收集本层所有块的激活值
-                a_cpu = torch.cat([layer_blocks[i] for i in range(num_blocks)], dim=0)
-                
-                # 单次数据传输到GPU
-                a_gpu = a_cpu.to('cuda', non_blocking=True)
-                
-                # 批量计算qkv_proj
-                attn = model.layers[layer_idx].self_attn
-                qkv, _ = attn.qkv_proj(a_gpu)
-                q, k, v = qkv.split([kv_size, kv_size, kv_size], dim=-1)
-                
-                # 批量应用旋转位置编码
-                positions = torch.arange(0, num_blocks * block_size, 
-                                    device=a_gpu.device)
-                q, k = attn.rotary_emb(positions, q, k)
-                
-                # 批量处理KV缓存
-                for i in range(num_blocks):
-                    start = i * block_size
-                    end = start + block_size
-                    target_block = block_table[i]
-                    
-                    # 提取并展平当前块的KV
-                    k_block = k[start:end].contiguous().view(-1)
-                    v_block = v[start:end].contiguous().view(-1)
-                    
-                    # 批量复制到GPU缓存
-                    self.gpu_cache[layer_idx][0][target_block].copy_(k_block)
-                    self.gpu_cache[layer_idx][1][target_block].copy_(v_block)
-            
-            # 更新序列状态
-            seq_data.update_num_computed_tokens(block_size * num_blocks)
-            seq_data.remove_prompt_cached_block()
+            a_store_dict[int(seq_group_metadata.request_id)] = prompt_a_stored_block
 
 
-    ################ FAST (TP 1) ################
+    ################ FAST ################
 
-    def fast_process_prompts_cache(self, seq_group_metadata_list: List[SequenceGroupMetadata]):
+    def process_prompts_cache(self, seq_group_metadata_list: List[SequenceGroupMetadata]):
         # 按层组织需要处理的数据
         layer_batches = defaultdict(lambda: {
             'a_cpu': [],
@@ -315,33 +286,32 @@ class Worker:
             'seq_data_list': []
         })
 
-        # 阶段1: 数据收集
         for seq_group_metadata in seq_group_metadata_list:
             if not seq_group_metadata.is_prompt:
-                continue
+                return False
             
             seq_ids = list(seq_group_metadata.seq_data.keys())
             if not seq_ids:
                 continue
-            seq_id = seq_ids[0]  # 假设每个组只有一个序列
+            seq_id = seq_ids[0]  # 每个组只有一个序列
             
             seq_data = seq_group_metadata.seq_data[seq_id]
-            prompt_cached_block = seq_data.get_prompt_cached_block()
-            if prompt_cached_block is None:
+            prompt_a_cached_block = seq_data.get_prompt_a_cached_block()
+            if prompt_a_cached_block is None:
                 continue
             
             block_table = seq_group_metadata.block_tables[seq_id]
-            num_blocks = prompt_cached_block[0].size(0)
+            num_blocks = prompt_a_cached_block[0].size(0)
             if num_blocks == 0:
                 continue
             
             # 记录全局位置偏移量（考虑已有计算量），一定为 0
             base_offset = seq_data.get_num_computed_tokens()
-            block_size = prompt_cached_block[0].size(1)
+            block_size = prompt_a_cached_block[0].size(1)
             
-            # 按层收集数据
-            for layer_idx in range(len(prompt_cached_block)):
-                layer_blocks = prompt_cached_block[layer_idx]
+            # 按层收集
+            for layer_idx in range(len(prompt_a_cached_block)):
+                layer_blocks = prompt_a_cached_block[layer_idx]
                 layer_batches[layer_idx]['a_cpu'].append(layer_blocks)
                 layer_batches[layer_idx]['block_tables'].extend(
                     [block_table[i] for i in range(num_blocks)])
@@ -349,11 +319,11 @@ class Worker:
                     [base_offset + i * block_size for i in range(num_blocks)])
                 layer_batches[layer_idx]['seq_data_list'].append(seq_data)
             
-            # 更新序列状态
+            # 更新序列
             seq_data.update_num_computed_tokens(block_size * num_blocks)
-            seq_data.remove_prompt_cached_block()
+            seq_data.remove_prompt_a_cached_block()
 
-        # 阶段2: 按层批量处理
+        # 按层批量处理
         model = self.model_runner.model.model
         for layer_idx, batch_data in layer_batches.items():
             if not batch_data['a_cpu']:
@@ -370,6 +340,8 @@ class Worker:
             qkv, _ = attn.qkv_proj(a_gpu)
             block_size = batch_data['a_cpu'][0].size(1)
             kv_size = self.gpu_cache[0].size(2) // block_size
+            assert(block_size == 16)
+            assert(kv_size == 4096)
             q, k, v = qkv.split([kv_size, kv_size, kv_size], dim=-1)
             
             # 批量生成位置编码
@@ -378,7 +350,7 @@ class Worker:
                 for offset in batch_data['position_offsets']
             ])
             q, k = attn.rotary_emb(positions, q, k)
-            
+
             # 批量填充KV缓存
             total_blocks = len(batch_data['block_tables'])
             for i in range(total_blocks):
@@ -392,6 +364,7 @@ class Worker:
                 self.gpu_cache[layer_idx][0][target_block].copy_(k_block)
                 self.gpu_cache[layer_idx][1][target_block].copy_(v_block)
 
+        return True
 
     @torch.inference_mode()
     def execute_model(
@@ -400,6 +373,7 @@ class Worker:
         blocks_to_swap_in: Optional[Dict[int, int]] = None,
         blocks_to_swap_out: Optional[Dict[int, int]] = None,
         blocks_to_copy: Optional[Dict[int, List[int]]] = None,
+        a_store_dict: Optional[Dict[int, List[Tensor]]] = None,
     ) -> Optional[SamplerOutput]:
         if self.is_driver_worker:
             assert seq_group_metadata_list is not None
@@ -428,19 +402,29 @@ class Worker:
         # If there is no input, we don't need to execute the model.
         if num_seq_groups == 0:
             return {}
-        
-        self.fast_process_prompts_cache(seq_group_metadata_list)
-        
-        # TODO: 按 layer 返回 hook
 
-        output = self.model_runner.execute_model(seq_group_metadata_list,
-                                                 self.gpu_cache)
+        # 处理所有输入的 prompt a cache，同时返回是否是 prompt
+        is_prompt = self.process_prompts_cache(seq_group_metadata_list)
+
+        # TODO: 按 layer 返回 hook
+        # TODO: 多卡间使用 nvlink 通信激活值
         
-        # TODO: execute 结束，将激活值存下来
-        # 实现方式：prompt_cached_block 并列开 prompt_stored_block
-        # 开关控制是否写回
-        # 可以用来检查正确性，同时模拟多轮对话
-        
+        # 开启 prompt a store
+        num_layers = int(os.getenv('NUM_LAYERS'))
+        # print(f"@ {is_prompt}, {os.getenv('ENABLE_PROMPT_A_STORE', 'False')=}")
+        a_store_list = [torch.empty(()) for i in range(num_layers)] \
+            if is_prompt and (os.getenv('ENABLE_PROMPT_A_STORE', 'False') == 'True') else None
+
+        output, a_store_list = self.model_runner.execute_model(seq_group_metadata_list,
+                                                 self.gpu_cache, a_store_list=a_store_list)
+
+        # TODO: execute 结束，将激活值存下来（已实现 demo）
+        # 实现方式：prompt_a_cached_block 并列开 prompt_a_stored_block
+        # 开关控制是否写回；可以用来检查正确性，同时模拟多轮对话
+
+        if a_store_list is not None:
+            self.process_prompts_store_demo(seq_group_metadata_list, a_store_list, a_store_dict)
+
         return output
 
     def add_lora(self, lora_request: LoRARequest) -> bool:

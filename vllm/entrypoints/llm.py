@@ -1,4 +1,5 @@
-from typing import List, Optional, Union
+import os
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -133,7 +134,7 @@ class LLM:
         lora_request: Optional[LoRARequest] = None,
         multi_modal_data: Optional[MultiModalData] = None,
         prompts_cached_block: Optional[List[Tensor]] = None,
-    ) -> List[RequestOutput]:
+    ) -> Tuple[List[RequestOutput], Optional[dict]]:
         """Generates the completions for the input prompts.
 
         NOTE: This class automatically batches the given prompts, considering
@@ -190,10 +191,12 @@ class LLM:
                     type=multi_modal_data.type,
                     data=multi_modal_data.data[i].unsqueeze(0))
                 if multi_modal_data else None,
-                prompt_cached_block=None if prompts_cached_block is None \
+                prompt_a_cached_block=None if prompts_cached_block is None \
                     else prompts_cached_block[i]
             )
-        return self._run_engine(use_tqdm)
+        # 启用 prompt a store
+        self.a_store_dict = dict() if os.getenv('ENABLE_PROMPT_A_STORE', 'False') == 'True' else None
+        return self._run_engine(use_tqdm), self.a_store_dict
 
     def _add_request(
         self,
@@ -202,7 +205,7 @@ class LLM:
         prompt_token_ids: Optional[List[int]],
         lora_request: Optional[LoRARequest] = None,
         multi_modal_data: Optional[MultiModalData] = None,
-        prompt_cached_block: Optional[List[Tensor]] = None,
+        prompt_a_cached_block: Optional[List[Tensor]] = None,
     ) -> None:
         request_id = str(next(self.request_counter))
         self.llm_engine.add_request(request_id,
@@ -211,7 +214,7 @@ class LLM:
                                     prompt_token_ids,
                                     lora_request=lora_request,
                                     multi_modal_data=multi_modal_data,
-                                    prompt_cached_block=prompt_cached_block)
+                                    prompt_a_cached_block=prompt_a_cached_block)
 
     def _run_engine(self, use_tqdm: bool) -> List[RequestOutput]:
         # Initialize tqdm.
@@ -223,7 +226,7 @@ class LLM:
         # Run the engine.
         outputs: List[RequestOutput] = []
         while self.llm_engine.has_unfinished_requests():
-            step_outputs = self.llm_engine.step()
+            step_outputs = self.llm_engine.step(self.a_store_dict)
             for output in step_outputs:
                 if output.finished:
                     outputs.append(output)

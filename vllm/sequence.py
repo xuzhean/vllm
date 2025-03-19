@@ -107,7 +107,7 @@ class SequenceData:
         self,
         prompt_token_ids: List[int],
         output_token_ids: Optional[List[int]] = None,
-        prompt_cached_block: Optional[List[Tensor]] = None,
+        prompt_a_cached_block: Optional[List[Tensor]] = None,
     ) -> None:
         if output_token_ids is None:
             output_token_ids = []
@@ -119,14 +119,23 @@ class SequenceData:
         self._num_computed_tokens = 0
 
         # shape: [layer_num, block_num, block_size, hidden]
-        self.prompt_cached_block = prompt_cached_block
-        
+        self.prompt_a_cached_block = prompt_a_cached_block
+        self.prompt_a_stored_block = None
+        self.prompt_a_stored_block_num = None
+        self.prompt_a_unblocked_size = None
 
-    def get_prompt_cached_block(self) -> Optional[List[Tensor]]:
-        return self.prompt_cached_block
+    def get_prompt_a_cached_block(self) -> Optional[List[Tensor]]:
+        return self.prompt_a_cached_block
     
-    def remove_prompt_cached_block(self) -> None:
-        self.prompt_cached_block = None
+    def remove_prompt_a_cached_block(self) -> None:
+        self.prompt_a_cached_block = None
+        
+    def set_prompt_a_stored_info(self, block_num: int, unblocked_size: int) -> None:
+        self.prompt_a_stored_block_num = block_num
+        self.prompt_a_unblocked_size = unblocked_size
+    
+    def get_pormpt_a_stored_info(self):
+        return self.prompt_a_stored_block_num, self.prompt_a_unblocked_size
 
     def append_token_id(self, token_id: int, logprob: float) -> None:
         self.output_token_ids.append(token_id)
@@ -204,7 +213,7 @@ class Sequence:
         block_size: int,
         eos_token_id: Optional[int] = None,
         lora_request: Optional[LoRARequest] = None,
-        prompt_cached_block: Optional[List[Tensor]] = None,
+        prompt_a_cached_block: Optional[List[Tensor]] = None,
     ) -> None:
         self.seq_id = seq_id
         self.prompt = prompt
@@ -213,7 +222,7 @@ class Sequence:
         self.lora_request = lora_request
 
         self.data = SequenceData(prompt_token_ids, 
-                                 prompt_cached_block=prompt_cached_block)
+                                 prompt_a_cached_block=prompt_a_cached_block)
         self.output_logprobs: SampleLogprobs = []
         self.output_text = ""
 

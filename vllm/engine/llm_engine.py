@@ -1,5 +1,6 @@
+import os
 import time
-from typing import Iterable, List, Optional, Tuple, Type, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Type, Union
 
 from torch import Tensor
 from transformers import PreTrainedTokenizer
@@ -254,7 +255,7 @@ class LLMEngine:
         arrival_time: Optional[float] = None,
         lora_request: Optional[LoRARequest] = None,
         multi_modal_data: Optional[MultiModalData] = None,
-        prompt_cached_block: Optional[List[Tensor]] = None,   # prompt 已经缓存在 CPU 的部分激活值
+        prompt_a_cached_block: Optional[List[Tensor]] = None,   # prompt 已经缓存在 CPU 的部分激活值
     ) -> None:
         """Add a request to the engine's request pool.
 
@@ -321,7 +322,7 @@ class LLMEngine:
         eos_token_id = self.tokenizer.get_lora_tokenizer(
             lora_request).eos_token_id
         seq = Sequence(seq_id, prompt, prompt_token_ids, block_size,
-                       eos_token_id, lora_request, prompt_cached_block)
+                       eos_token_id, lora_request, prompt_a_cached_block)
 
         # Defensive copy of SamplingParams, which are used by the sampler,
         # this doesn't deep-copy LogitsProcessor objects
@@ -617,7 +618,7 @@ class LLMEngine:
             self.stat_logger.log(self._get_stats(scheduler_outputs))
         return request_outputs
 
-    def step(self) -> List[RequestOutput]:
+    def step(self, a_store_dict: Optional[Dict[int, List[Tensor]]] = None) -> List[RequestOutput]:
         """Performs one decoding iteration and returns newly generated results.
 
         .. figure:: https://i.imgur.com/sv2HssD.png
@@ -671,7 +672,7 @@ class LLMEngine:
         seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
 
         """
-        # 处理未复制的 prompt_cached_block
+        # 处理未复制的 prompt_a_cached_block
         # 应在 worker 中处理
         for seq_group_metadata in seq_group_metadata_list:
             if not seq_group_metadata.is_prompt:
@@ -681,18 +682,19 @@ class LLMEngine:
             assert len(seq_ids) == 1
             seq_id = seq_ids[0]
             seq_data = seq_group_metadata.seq_data[seq_id]
-            prompt_cached_block = seq_data.get_prompt_cached_block()
-            if prompt_cached_block is None:
+            prompt_a_cached_block = seq_data.get_prompt_a_cached_block()
+            if prompt_a_cached_block is None:
                 continue
             
-            logger.info(f"### {seq_data.prompt_token_ids=}  #  {prompt_cached_block=}")
+            logger.info(f"### {seq_data.prompt_token_ids=}  #  {prompt_a_cached_block=}")
         """
 
         if not scheduler_outputs.is_empty():
             output = self.model_executor.execute_model(
                 seq_group_metadata_list, scheduler_outputs.blocks_to_swap_in,
                 scheduler_outputs.blocks_to_swap_out,
-                scheduler_outputs.blocks_to_copy)
+                scheduler_outputs.blocks_to_copy,
+                a_store_dict=a_store_dict)
         else:
             output = []
 
