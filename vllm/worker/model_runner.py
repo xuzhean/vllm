@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch import Tensor
+from vllm.timer import Timer
 
 from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.config import (DeviceConfig, LoRAConfig, ModelConfig, ParallelConfig,
@@ -660,6 +661,11 @@ class ModelRunner:
         if self.lora_config:
             self.set_active_loras(lora_requests, lora_mapping)
 
+        # 统计 prefill compute 所需总时间，开始标记
+        is_prompt = seq_group_metadata_list[0].is_prompt
+        if is_prompt:
+            Timer.start('prefill_compute')
+
         # Execute the model.
         if attn_metadata.use_cuda_graph:
             graph_batch_size = input_tokens.shape[0]
@@ -689,6 +695,11 @@ class ModelRunner:
             logits=logits,
             sampling_metadata=sampling_metadata,
         )
+
+        # prefill 计算结束标记
+        if is_prompt:
+            Timer.end('prefill_compute')
+            
         return output, a_store_list
 
     @torch.inference_mode()
