@@ -320,8 +320,10 @@ class Worker:
                 layer_batches[layer_idx]['seq_data_list'].append(seq_data)
             
             # 更新序列
-            seq_data.update_num_computed_tokens(block_size * num_blocks)
             seq_data.remove_prompt_a_cached_block()
+            # NOTE: 暂时不更新 computed_tokens 是因为该版本的 vllm 不支持 chunked prefill
+            #       目前仅考虑完整缓存部分的 prefill 时间对比：使用激活值缓存重算 kv / 直接缓存 kv / 完整算 kv
+            # seq_data.update_num_computed_tokens(block_size * num_blocks)
 
         # 按层批量处理
         model = self.model_runner.model.model
