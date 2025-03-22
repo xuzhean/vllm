@@ -189,7 +189,7 @@ class Worker:
         if blocks_to_copy:
             self.cache_engine.copy(blocks_to_copy)
 
-    ################ Demo ################
+    ## Demo version.
 
     def move_prompt_cache(self, a_cache: Tensor, k_cache: Tensor, v_cache: Tensor, 
                           qkv_proj: QKVParallelLinear, rotary_emb: RotaryEmbedding,
@@ -240,7 +240,6 @@ class Worker:
     # cpu act cache: num_layers * [num_blocks, block_size, hidden_size]
     # gpu kv cache: num_layers * [2, num_blocks, block_size * num_kv_heads * head_size]
 
-
     def process_prompts_store_demo(self, seq_group_metadata_list: List[SequenceGroupMetadata],
                                    a_store_list: List[Tensor],
                                    a_store_dict: Optional[Dict[int, List[Tensor]]] = None):
@@ -275,18 +274,14 @@ class Worker:
             
             a_store_dict[int(seq_group_metadata.request_id)] = prompt_a_stored_block
 
-
-    ################ Process by Layers ################
-
-    # @torch.compile
+    ## Pytorch normal version.
+    
     def process_prompts_cache(self, seq_group_metadata_list: List[SequenceGroupMetadata],
-                              block_size, kv_size):
+                              num_layers, block_size, hidden_size):
         # 按层组织需要处理的数据
         layer_batches = defaultdict(lambda: {
             'a_cpu': [],
             'block_tables': [],
-            'position_offsets': [],
-            'seq_data_list': []
         })
 
         for seq_group_metadata in seq_group_metadata_list:
@@ -294,9 +289,7 @@ class Worker:
                 return False
             
             seq_ids = list(seq_group_metadata.seq_data.keys())
-            if not seq_ids:
-                continue
-            seq_id = seq_ids[0]  # 每个组只有一个序列
+            seq_id = seq_ids[0]
             
             seq_data = seq_group_metadata.seq_data[seq_id]
             prompt_a_cached_block = seq_data.get_prompt_a_cached_block()
@@ -314,9 +307,6 @@ class Worker:
                 layer_batches[layer_idx]['a_cpu'].append(layer_blocks)
                 layer_batches[layer_idx]['block_tables'].extend(
                     [block_table[i] for i in range(num_blocks)])
-                layer_batches[layer_idx]['position_offsets'].extend(
-                    [i * block_size for i in range(num_blocks)])
-                layer_batches[layer_idx]['seq_data_list'].append(seq_data)
             
             # 更新序列
             seq_data.remove_prompt_a_cached_block()
@@ -325,7 +315,6 @@ class Worker:
             # seq_data.update_num_computed_tokens(block_size * num_blocks)
 
         # 按层批量处理
-        model = self.model_runner.model.model
         a_gpu_list = []
         for layer_idx, batch_data in layer_batches.items():
             if not batch_data['a_cpu']:
@@ -338,17 +327,18 @@ class Worker:
             # 异步传输到GPU
             a_gpu_list.append(a_cpu.to('cuda', non_blocking=True))
 
+        model = self.model_runner.model.model
         for layer_idx, batch_data in layer_batches.items():
             if not batch_data['a_cpu']:
                 continue
-            
+
             a_gpu = a_gpu_list[layer_idx]
-            
+
             # 批量计算QKV投影
             attn = model.layers[layer_idx].self_attn
             qkv, _ = attn.qkv_proj(a_gpu)
-            q, k, v = qkv.split([kv_size, kv_size, kv_size], dim=-1)
-            
+            q, k, v = qkv.split([hidden_size, hidden_size, hidden_size], dim=-1)
+
             # 批量生成位置编码
             total_blocks = len(batch_data['block_tables'])
             positions = torch.arange(0, total_blocks * block_size, device=a_gpu.device)
@@ -357,18 +347,18 @@ class Worker:
             # 将k/v reshape为(total_blocks, block_size, hidden_size)
             k_blocks = k.view(total_blocks, block_size, -1)
             v_blocks = v.view(total_blocks, block_size, -1)
-            
+
             # 展平每个块以匹配缓存格式 [max_blocks, block_size * hidden_size]
             k_blocks_flat = k_blocks.flatten(1)
             v_blocks_flat = v_blocks.flatten(1)
-            
+
             # 创建目标块索引张量
             target_blocks = torch.tensor(
                 batch_data['block_tables'], 
                 device='cuda',
                 dtype=torch.long
             )
-            
+
             # 批量复制到GPU缓存
             self.gpu_cache[layer_idx][0][target_blocks] = k_blocks_flat
             self.gpu_cache[layer_idx][1][target_blocks] = v_blocks_flat
@@ -414,9 +404,8 @@ class Worker:
 
         # 处理所有输入的 prompt a cache，同时返回是否是 prompt
         Timer.start('prompt_a_cache')
-        # block_size, kv_size = int(os.getenv('BLOCK_SIZE')), int(os.getenv('HIDDEN_SIZE'))
-        block_size, kv_size = 16, 4096
-        is_prompt = self.process_prompts_cache(seq_group_metadata_list, block_size, kv_size)
+        num_layers, block_size, hidden_size = int(os.getenv('NUM_LAYERS')), int(os.getenv('BLOCK_SIZE')), int(os.getenv('HIDDEN_SIZE'))
+        is_prompt = self.process_prompts_cache(seq_group_metadata_list, num_layers, block_size, hidden_size)
         Timer.end('prompt_a_cache')
 
         # TODO: 按 layer 返回 hook

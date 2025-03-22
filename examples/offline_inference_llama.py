@@ -26,7 +26,7 @@ torch.cuda.manual_seed_all(seed)
 sampling_params = SamplingParams(
     temperature=0.7,
     top_p=0.9,
-    max_tokens=128,
+    max_tokens=16,
     ignore_eos=True,
 )
 
@@ -61,7 +61,7 @@ if os.getenv('ENABLE_PROMPT_A_STORE', 'False') == 'True':
 else:
     # pass
     prompts_cached_block = []
-    loaded_tensors = torch.load('tmp.pt')
+    loaded_tensors = torch.load('../tmp.pt')
     num_layers = int(os.getenv('NUM_LAYERS'))
     for i in range(num_requests):
         cached_block = []
@@ -79,6 +79,10 @@ print(f"prefill_compute: {Timer.get_time('prefill_compute')} s")
 print(f"prompt_a_cache: {Timer.get_time('prompt_a_cache')} s")
 print(f"prompt_kv_cache: {Timer.get_time('prompt_kv_cache')} s")
 
+print(f"@ {Timer.get_time('p1')=}")
+print(f"@ {Timer.get_time('p2')=}")
+print(f"@ {Timer.get_time('p3')=}")
+
 if a_store_dict is not None:
     num_layers = int(os.getenv('NUM_LAYERS'))
     save_tensors_dict = dict()
@@ -86,4 +90,4 @@ if a_store_dict is not None:
         # print(f"{id=}: {a_store[0]}")
         for layer_idx in range(num_layers):
             save_tensors_dict[str(id) + '.' + str(layer_idx)] = a_store[layer_idx]
-    torch.save(save_tensors_dict, 'tmp.pt')
+    torch.save(save_tensors_dict, '../tmp.pt')
